@@ -18,14 +18,14 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -117,13 +117,13 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
@@ -133,18 +133,20 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+	   d.Decode(&votedFor) != nil ||
+		 d.Decode(&logs) != nil {
+	  	DPrintf("cannot read persist")
+	} else {
+	  rf.currentTerm = currentTerm
+	  rf.votedFor = votedFor
+		rf.log = logs
+	}
 }
 
 
@@ -168,6 +170,7 @@ func (rf *Raft) convertToFollower(term int) {
 	rf.role = FOLLOWER
 	rf.currentTerm = term
 	rf.votedFor = -1
+	rf.persist()
 }
 
 func (rf *Raft) convertToCandidate() {
@@ -175,6 +178,7 @@ func (rf *Raft) convertToCandidate() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.setElectionTimeout()
+	rf.persist()
 }
 
 func (rf *Raft) convertToLeader() {
@@ -254,6 +258,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// grand vote
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
+			rf.setElectionTimeout()
+			rf.persist()
 			return
 		}
 	}
@@ -273,6 +279,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term						int
 	Success					bool
+	ConflictIndex		int
+	ConflictTerm		int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -294,7 +302,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.setElectionTimeout()
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-	if args.PrevLogIndex >= len(rf.log) || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+	// 2.1 If a follower does not have prevLogIndex in its log
+	// it should return with conflictIndex = len(log) and conflictTerm = None
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
+		return
+	}
+	// 2.2 If a follower does have prevLogIndex in its log, but the term does not match
+	// it should return conflictTerm = log[prevLogIndex].Term, and then search its log for the first index whose entry has term equal to conflictTerm.
+	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		conflictTerm := rf.log[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex; i > 0; i-- {
+			if rf.log[i - 1].Term != conflictTerm {
+				reply.ConflictIndex = i
+			}
+		}
+		reply.ConflictTerm = conflictTerm
 		reply.Success = false
 		return
 	}
@@ -315,6 +340,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if conflictOrNew != -1 {
 		rf.log = append(rf.log[:conflictOrNew + args.PrevLogIndex + 1], args.Entries[conflictOrNew:]...)
+		rf.persist()
 	}
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -423,6 +449,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term: term,
 		Command: command,
 	})
+	rf.persist()
 	return index, term, true
 }
 
@@ -595,9 +622,15 @@ func (rf *Raft) logAppendWorker() {
 						rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 						rf.nextIndex[server] = rf.matchIndex[server] + 1
 					case FAIL:
-						// decrement nextIndex and retry
-						if rf.nextIndex[server] > 1 {
-							rf.nextIndex[server]--
+						// set nextIndex = conflictIndex by default
+						rf.nextIndex[server] = reply.ConflictIndex
+						// search its log for conflictTerm, set nextIndex to be the one beyond the index of the last entry in that term in its log
+						conflictTerm := reply.ConflictTerm
+						for i := args.PrevLogIndex; i > 0; i-- {
+							if rf.log[i - 1].Term == conflictTerm {
+								rf.nextIndex[server] = i;
+								return
+							}
 						}
 						DPrintf("[Term %d]: Raft[%d] need to retry append log[%d] to Raft[%d]", rf.currentTerm, rf.me, rf.nextIndex[server], server)
 				}

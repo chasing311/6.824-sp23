@@ -157,6 +157,9 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
 
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the

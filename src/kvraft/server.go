@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
 )
 
 const Debug = false
@@ -58,10 +59,8 @@ type LastRequest struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	kv.mu.Lock()
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
-		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
@@ -71,7 +70,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClientId: args.ClientId,
 		RequestId: args.RequestId,
 	}
-	kv.mu.Unlock()
 
 	index, _, _ := kv.rf.Start(getOp)
 	opApplyCh := kv.getOpApplyCh(index)
@@ -88,10 +86,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kv.mu.Lock()
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
-		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
@@ -103,11 +99,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		RequestId: args.RequestId,
 	}
 	if kv.isOpDuplicate(putAppendOp) {
-		kv.mu.Unlock()
 		reply.Err = OK
 		return
 	}
-	kv.mu.Unlock()
 
 	index, _, _ := kv.rf.Start(putAppendOp)
 	opApplyCh := kv.getOpApplyCh(index)
@@ -126,6 +120,9 @@ func (kv *KVServer) msgApplier() {
 	for msg := range(kv.applyCh) {
 		if msg.CommandValid {
 			kv.applyCommandMsg(msg)
+		}
+		if msg.SnapshotValid {
+			kv.applySnapshotMsg(msg)
 		}
 	}
 }
@@ -149,6 +146,12 @@ func (kv *KVServer) applyCommandMsg(msg raft.ApplyMsg) {
 	if isLeader {
 		opApplyCh <- value
 	}
+	kv.snapshotIfNeed(msg.CommandIndex)
+}
+
+func (kv *KVServer) applySnapshotMsg(msg raft.ApplyMsg) {
+	kv.lastApplied = msg.SnapshotIndex
+	kv.switchToSnapshot(msg.Snapshot)
 }
 
 func (kv *KVServer) getOpApplyCh(index int) chan string {
@@ -169,6 +172,8 @@ func (kv *KVServer) deleteOpApplyCh(index int) {
 }
 
 func (kv *KVServer) isOpDuplicate(op Op) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	lastRequest, ok := kv.lastRequestMap[op.ClientId]
 	if !ok {
 		return false
@@ -194,6 +199,43 @@ func (kv *KVServer) applyOpToStorage(op Op) string {
 		kv.KVStorage[op.Key] += op.Value
 	}
 	return kv.KVStorage[op.Key]
+}
+
+func (kv *KVServer) snapshotIfNeed(snapshotIndex int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if kv.maxraftstate < kv.rf.GetRaftStateSize() {
+		kv.rf.Snapshot(snapshotIndex, kv.encodeServerState())
+	}
+}
+
+func (kv *KVServer) encodeServerState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.KVStorage)
+	e.Encode(kv.lastRequestMap)
+	serverState := w.Bytes()
+	return serverState
+}
+
+func (kv *KVServer) switchToSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var KVStorage map[string]string
+	var lastRequestMap map[int]LastRequest
+	if d.Decode(&KVStorage) != nil ||
+	   d.Decode(&lastRequestMap) != nil {
+	  	DPrintf("cannot read persist")
+	} else {
+	  kv.KVStorage = KVStorage
+		kv.lastRequestMap = lastRequestMap
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -244,6 +286,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.switchToSnapshot(persister.ReadSnapshot())
 
 	// You may need initialization code here.
 	go kv.msgApplier()

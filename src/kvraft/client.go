@@ -8,6 +8,9 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderId			int
+	requestId			int
+	clientId			int
 }
 
 func nrand() int64 {
@@ -21,7 +24,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.setRandomLeaderId()
+	ck.clientId = int(nrand())
+	ck.requestId = 0
 	return ck
+}
+
+func (ck *Clerk) setRandomLeaderId() {
+	ck.leaderId = int(nrand()) % len(ck.servers)
 }
 
 // fetch the current value for a key.
@@ -37,7 +47,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	ck.requestId++
+	args := GetArgs {
+		Key: key,
+		ClientId: ck.clientId,
+		RequestId: ck.requestId,
+	}
+
+	for {
+		reply := GetReply {}
+		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
+		if !ok {
+			ck.setRandomLeaderId()
+			continue
+		}
+		if reply.Err == OK {
+			return reply.Value
+		}
+		if reply.Err == ErrNoKey {
+			return ""
+		}
+		ck.setRandomLeaderId()
+	}
 }
 
 // shared by Put and Append.
@@ -50,11 +81,32 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.requestId++
+	args := PutAppendArgs {
+		Key: key,
+		Value: value,
+		Op: op,
+		ClientId: ck.clientId,
+		RequestId: ck.requestId,
+	}
+
+	for {
+		reply := PutAppendReply {}
+		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
+		if !ok {
+			ck.setRandomLeaderId()
+			continue
+		}
+		if reply.Err == OK {
+			return
+		}
+		ck.setRandomLeaderId()
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, OpPut)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, OpAppend)
 }

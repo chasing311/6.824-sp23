@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,11 +19,19 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	REQUEST_TIMEOUT				= 200
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OpType					string
+	Key							string
+	Value						string
+	ClientId				int
+	RequestId				int
 }
 
 type KVServer struct {
@@ -35,15 +44,156 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	KVStorage				map[string]string
+	lastApplied			int											// last applied command index
+	opApplyChMap		map[int]chan string			// Op apply channel for current request command
+	lastRequestMap	map[int]LastRequest     // Clientid -> LastRequest, for every client, record last request it sent
+}
+
+type LastRequest struct {
+	RequestId				int
+	Value						string
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	getOp := Op {
+		OpType: OpGet,
+		Key: args.Key,
+		ClientId: args.ClientId,
+		RequestId: args.RequestId,
+	}
+	kv.mu.Unlock()
+
+	index, _, _ := kv.rf.Start(getOp)
+	opApplyCh := kv.getOpApplyCh(index)
+
+	select {
+	case value := <- opApplyCh:
+		reply.Err, reply.Value = OK, value
+	case <-time.After(REQUEST_TIMEOUT * time.Millisecond):
+		reply.Err = ErrTimeout
+	}
+
+	go kv.deleteOpApplyCh(index)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	putAppendOp := Op {
+		OpType: args.Op,
+		Key: args.Key,
+		Value: args.Value,
+		ClientId: args.ClientId,
+		RequestId: args.RequestId,
+	}
+	if kv.isOpDuplicate(putAppendOp) {
+		kv.mu.Unlock()
+		reply.Err = OK
+		return
+	}
+	kv.mu.Unlock()
+
+	index, _, _ := kv.rf.Start(putAppendOp)
+	opApplyCh := kv.getOpApplyCh(index)
+
+	select {
+	case <- opApplyCh:
+		reply.Err = OK
+	case <-time.After(REQUEST_TIMEOUT * time.Millisecond):
+		reply.Err = ErrTimeout
+	}
+
+	go kv.deleteOpApplyCh(index)
+}
+
+func (kv *KVServer) msgApplier() {
+	for msg := range(kv.applyCh) {
+		if msg.CommandValid {
+			kv.applyCommandMsg(msg)
+		}
+	}
+}
+
+func (kv *KVServer) applyCommandMsg(msg raft.ApplyMsg) {
+	if msg.CommandIndex <= kv.lastApplied {
+		return
+	}
+	kv.lastApplied = msg.CommandIndex
+	op := msg.Command.(Op)
+	opApplyCh := kv.getOpApplyCh(msg.CommandIndex)
+
+	if kv.isOpDuplicate(op) {
+		opApplyCh <- kv.lastRequestMap[op.ClientId].Value
+		return
+	}
+	value := kv.applyOpToStorage(op)
+	kv.setLastRequest(op, value)
+
+	_, isLeader := kv.rf.GetState()
+	if isLeader {
+		opApplyCh <- value
+	}
+}
+
+func (kv *KVServer) getOpApplyCh(index int) chan string {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	opApplyCh, ok := kv.opApplyChMap[index]
+	if ok {
+		return opApplyCh
+	}
+	kv.opApplyChMap[index] = make(chan string, 1)
+	return kv.opApplyChMap[index]
+}
+
+func (kv *KVServer) deleteOpApplyCh(index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	delete(kv.opApplyChMap, index)
+}
+
+func (kv *KVServer) isOpDuplicate(op Op) bool {
+	lastRequest, ok := kv.lastRequestMap[op.ClientId]
+	if !ok {
+		return false
+	}
+	return lastRequest.RequestId == op.RequestId
+}
+
+func (kv *KVServer) setLastRequest(op Op, value string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.lastRequestMap[op.ClientId] = LastRequest {
+		RequestId: op.RequestId,
+		Value: value,
+	}
+}
+
+func (kv *KVServer) applyOpToStorage(op Op) string {
+	switch op.OpType {
+	case OpGet:
+	case OpPut:
+		kv.KVStorage[op.Key] = op.Value
+	case OpAppend:
+		kv.KVStorage[op.Key] += op.Value
+	}
+	return kv.KVStorage[op.Key]
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -87,11 +237,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.KVStorage = make(map[string]string)
+	kv.lastApplied = 0
+	kv.opApplyChMap = make(map[int]chan string)
+	kv.lastRequestMap = make(map[int]LastRequest)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go kv.msgApplier()
 
 	return kv
 }

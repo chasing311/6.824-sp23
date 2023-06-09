@@ -313,15 +313,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 2.2 If a follower does have prevLogIndex in its log, but the term does not match
 	// it should return conflictTerm = log[prevLogIndex].Term, and then search its log for the first index whose entry has term equal to conflictTerm.
 	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		reply.Success = false
 		conflictTerm := rf.log[args.PrevLogIndex].Term
+		reply.ConflictTerm = conflictTerm
 		for i := args.PrevLogIndex; i > 0; i-- {
 			if rf.log[i - 1].Term != conflictTerm {
 				reply.ConflictIndex = i
+				return
 			}
 		}
-		reply.ConflictTerm = conflictTerm
-		reply.Success = false
-		return
 	}
 
 	conflictOrNew := -1

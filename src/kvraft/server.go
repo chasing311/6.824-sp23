@@ -45,17 +45,11 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	KVStorage				map[string]string
-	lastApplied			int											// last applied command index
-	opApplyChMap		map[int]chan string			// Op apply channel for current request command
-	lastRequestMap	map[int]LastRequest     // Clientid -> LastRequest, for every client, record last request it sent
+	KVStorage			map[string]string
+	lastApplied			int							// last applied command index
+	opApplyChMap		map[int]chan string			// commandIndex -> chan, Op apply channel for current request command, apply Op and reply after servers reach agreement
+	lastRequestMap		map[int]int     			// Clientid -> LastRequestId, for every client, record last request it sent to detect duplicate
 }
-
-type LastRequest struct {
-	RequestId				int
-	Value						string
-}
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
@@ -64,6 +58,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+
 	getOp := Op {
 		OpType: OpGet,
 		Key: args.Key,
@@ -71,12 +66,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		RequestId: args.RequestId,
 	}
 
-	index, _, _ := kv.rf.Start(getOp)
+	index, term, _ := kv.rf.Start(getOp)
 	opApplyCh := kv.getOpApplyCh(index)
 
 	select {
 	case value := <- opApplyCh:
-		reply.Err, reply.Value = OK, value
+		currentTerm, isLeader := kv.rf.GetState()
+		if !isLeader || currentTerm != term {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err, reply.Value = OK, value
+		}
 	case <-time.After(REQUEST_TIMEOUT * time.Millisecond):
 		reply.Err = ErrTimeout
 	}
@@ -91,6 +91,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	if kv.isDuplicateRequest(args.ClientId, args.RequestId) {
+		reply.Err = OK
+		return
+	}
+
 	putAppendOp := Op {
 		OpType: args.Op,
 		Key: args.Key,
@@ -98,17 +103,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId: args.ClientId,
 		RequestId: args.RequestId,
 	}
-	if kv.isOpDuplicate(putAppendOp) {
-		reply.Err = OK
-		return
-	}
-
-	index, _, _ := kv.rf.Start(putAppendOp)
+	index, term, _ := kv.rf.Start(putAppendOp)
 	opApplyCh := kv.getOpApplyCh(index)
 
 	select {
 	case <- opApplyCh:
-		reply.Err = OK
+		currentTerm, isLeader := kv.rf.GetState()
+		if !isLeader || currentTerm != term {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = OK
+		}
 	case <-time.After(REQUEST_TIMEOUT * time.Millisecond):
 		reply.Err = ErrTimeout
 	}
@@ -132,26 +137,41 @@ func (kv *KVServer) applyCommandMsg(msg raft.ApplyMsg) {
 		return
 	}
 	kv.lastApplied = msg.CommandIndex
-	op := msg.Command.(Op)
-	opApplyCh := kv.getOpApplyCh(msg.CommandIndex)
 
-	if kv.isOpDuplicate(op) {
-		opApplyCh <- kv.lastRequestMap[op.ClientId].Value
-		return
+	op := msg.Command.(Op)
+	var value string
+	if op.OpType != OpGet && kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+		value = ""
+	} else {
+		value = kv.applyOp(op)
+		kv.setLastRequest(op.ClientId, op.RequestId)
 	}
-	value := kv.applyOpToStorage(op)
-	kv.setLastRequest(op, value)
 
 	_, isLeader := kv.rf.GetState()
 	if isLeader {
+		opApplyCh := kv.getOpApplyCh(msg.CommandIndex)
 		opApplyCh <- value
 	}
 	kv.snapshotIfNeed(msg.CommandIndex)
 }
 
 func (kv *KVServer) applySnapshotMsg(msg raft.ApplyMsg) {
+	if msg.SnapshotIndex <= kv.lastApplied {
+		return
+	}
 	kv.lastApplied = msg.SnapshotIndex
 	kv.switchToSnapshot(msg.Snapshot)
+}
+
+func (kv *KVServer) applyOp(op Op) string {
+	switch op.OpType {
+	case OpGet:
+	case OpPut:
+		kv.KVStorage[op.Key] = op.Value
+	case OpAppend:
+		kv.KVStorage[op.Key] += op.Value
+	}
+	return kv.KVStorage[op.Key]
 }
 
 func (kv *KVServer) getOpApplyCh(index int) chan string {
@@ -171,34 +191,20 @@ func (kv *KVServer) deleteOpApplyCh(index int) {
 	delete(kv.opApplyChMap, index)
 }
 
-func (kv *KVServer) isOpDuplicate(op Op) bool {
+func (kv *KVServer) isDuplicateRequest(clientId int, requestId int) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	lastRequest, ok := kv.lastRequestMap[op.ClientId]
+	lastRequestId, ok := kv.lastRequestMap[clientId]
 	if !ok {
 		return false
 	}
-	return lastRequest.RequestId == op.RequestId
+	return lastRequestId == requestId
 }
 
-func (kv *KVServer) setLastRequest(op Op, value string) {
+func (kv *KVServer) setLastRequest(clientId int, requestId int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	kv.lastRequestMap[op.ClientId] = LastRequest {
-		RequestId: op.RequestId,
-		Value: value,
-	}
-}
-
-func (kv *KVServer) applyOpToStorage(op Op) string {
-	switch op.OpType {
-	case OpGet:
-	case OpPut:
-		kv.KVStorage[op.Key] = op.Value
-	case OpAppend:
-		kv.KVStorage[op.Key] += op.Value
-	}
-	return kv.KVStorage[op.Key]
+	kv.lastRequestMap[clientId] = requestId
 }
 
 func (kv *KVServer) snapshotIfNeed(snapshotIndex int) {
@@ -228,7 +234,7 @@ func (kv *KVServer) switchToSnapshot(snapshot []byte) {
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var KVStorage map[string]string
-	var lastRequestMap map[int]LastRequest
+	var lastRequestMap map[int]int
 	if d.Decode(&KVStorage) != nil ||
 	   d.Decode(&lastRequestMap) != nil {
 	  	DPrintf("cannot read persist")
@@ -282,7 +288,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.KVStorage = make(map[string]string)
 	kv.lastApplied = 0
 	kv.opApplyChMap = make(map[int]chan string)
-	kv.lastRequestMap = make(map[int]LastRequest)
+	kv.lastRequestMap = make(map[int]int)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
